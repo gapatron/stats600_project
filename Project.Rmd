@@ -1,0 +1,370 @@
+---
+title: "STATS600_Project"
+author: "Gabriel Patron"
+date: "2022-11-24"
+output: html_document
+---
+
+# Introduction
+
+For this
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Packages
+
+```{r echo = T, results = 'hide'}
+library("TCGAbiolinks")
+library("limma")
+library("edgeR")
+library("glmnet")
+library("factoextra")
+library("FactoMineR")
+library("caret")
+library("SummarizedExperiment")
+library("gplots")
+library("survival")
+library("survminer")
+library("RColorBrewer")
+library("gProfileR")
+library("genefilter")
+library("pca3d") #Plot 3D PCA
+library("tsne")#t-distributed stochastic neighbor embedding calculation
+library("rgl")#3D visualization
+library("randomForest")
+library("MASS")
+library("caret")
+library("glmnet")
+library("pROC") # For ROC curves
+
+```
+
+
+
+
+In this project we will use the data for Prostate Adenocarcinoma patients 
+clinical, expression, DNA methylation and genotyping data. We will work with clinical and expression data (RNA-seq). https://portal.gdc.cancer.gov/projects/TCGA-PRAD 
+
+Using the TCGAbiolinks library, we will query, prepare and download data from the TCGA portal. TCGAbiolinks provides important functionality as matching data of same the donors across distinct data types (clinical vs expression) and provides data structures to make its analysis in R easy.
+
+
+First, we will query the TCGA database using GDCquery, from TCGAbiolinks
+
+
+```{r}
+TCGAbiolinks:::getProjectSummary("TCGA-PRAD")
+
+## $case_count
+```
+## Data Preparation
+Using the following commands we will query, download and prepare the data for analysis.
+
+### Query
+Now we create our query, using GDCquery, from TCGAbiolinks:
+```{r results='hide'}
+query_TCGA = GDCquery(
+  project = "TCGA-PRAD",
+  data.category = "Transcriptome Profiling", # parameter enforced by GDCquery
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "STAR - Counts",
+  sample.type = c("Primary Tumor", "Solid Tissue Normal"),
+  data.type = "Gene Expression Quantification")
+```
+
+We save the results from the query:
+```{r}
+read_res = getResults(query_TCGA)
+```
+
+Read the column names:
+```{r}
+colnames(read_res)
+```
+
+
+Explore the sample type counts:
+```{r}
+summary(factor(read_res$sample_type))
+```
+
+
+### Download files
+
+GDCdownload, also from TCGAbiolinks, downloads a raw version of the files. 
+
+```{r echo=FALSE}
+GDCdownload(query = query_TCGA)
+```
+
+
+### Prepare data
+GDCprepare reads and formats the files into R data structures
+
+```{r echo=FALSE}
+tcga_data = GDCprepare(query_TCGA)
+```
+
+
+
+### Save data
+
+We save our data so we do not need to download it back again, which is a slow,
+tedious process.
+```{r}
+# Save the data as a file, if you need it later, you can just load this file
+# instead of having to run the whole pipeline again
+saveRDS(object = tcga_data,
+        file = "tcga_data_READ.RDS",
+        compress = FALSE)
+```
+
+
+### Load data
+
+Loads data
+```{r}
+tcga_data = readRDS(file = "tcga_data_READ.RDS")
+```
+
+
+
+
+## Pipeline
+
+In this section we transform the data and normalize it to a format appropriate for analysis,
+as per 
+```{r}
+limma_pipeline = function(
+  tcga_data,
+  condition_variable,
+  reference_group=NULL){
+
+  design_factor = colData(tcga_data)[, condition_variable, drop=T]
+
+  group = factor(design_factor)
+  if(!is.null(reference_group)){group = relevel(group, ref=reference_group)}
+
+  design = model.matrix(~ group)
+
+  dge = DGEList(counts=assay(tcga_data),
+                 samples=colData(tcga_data),
+                 genes=as.data.frame(rowData(tcga_data)))
+
+  # filtering
+  keep = filterByExpr(dge,design)
+  dge = dge[keep,,keep.lib.sizes=FALSE]
+  rm(keep)
+
+  # Normalization (TMM followed by voom)
+  dge = calcNormFactors(dge)
+  v = voom(dge, design, plot=TRUE)
+
+  # Fit model to data given design
+  fit = lmFit(v, design)
+  fit = eBayes(fit)
+
+  # Show top genes
+  topGenes = topTable(fit, coef=ncol(design), number=500, sort.by="p")
+  #topGenes = topTable(fit, coef=ncol(design), p.value = 0.01, sort.by="p")
+  return(
+    list(
+      voomObj=v, # normalized data
+      fit=fit, # fitted model and statistics
+      topGenes=topGenes # the 500 most differentially expressed genes
+    )
+  )
+}
+```
+
+```{r}
+limma_res = limma_pipeline(
+  tcga_data=tcga_data,
+  condition_variable="definition",
+  reference_group="Solid Tissue Normal"
+)
+```
+
+
+
+
+
+# Principal Component Visualization
+
+We use Principal Components to get a first view into the structure of our data.
+
+```{r}
+pca = prcomp(t(limma_res$voomObj$E))
+group = factor(limma_res$voomObj$targets[, "definition"])
+pca3d(pca, group=group, legend="topleft")
+```
+
+## Data selection
+
+
+Before proceeding, we must select our data based on the top genes. This is due
+to the fact that t-sne algorithm is pretty heavy to run, so we will subset with the
+best genes, as selected by ebayes p-values.
+```{r}
+# Select the top genes
+topGenes = limma_res$topGenes
+topGenes.names = rownames(topGenes)
+# Transpose and make it into a matrix object
+d_mat = as.matrix(t(limma_res$voomObj$E))
+
+d_mat_subselection = d_mat[,topGenes.names]
+# As before, we want this to be a factor
+d_resp = as.factor(limma_res$voomObj$targets$definition)
+```
+
+
+## T-SNE 3D
+
+In this chunk we run the t-sne algorithm for our data, since this visualization
+algorithm is different from PCA, it might show us something different.
+```{r}
+t_3d = tsne(d_mat_subselection, k=3, perplexity=35)
+```
+
+
+Plotting T-SNE in 3-D!
+```{r T-SNE-3D}
+tsne3d <- cbind(t_3d, d_resp)
+m = tsne3d[tsne3d[,4] ==  1,]
+b = tsne3d[tsne3d[,4] == 2,]
+plot3d(x = b[,1], y= b[,2], z= b[,3], type = "s", radius = 2, xlab="t-sne 1", ylab="t-sne 2", zlab="t-sne 3", col="yellow", axes=FALSE)
+rgl.bbox(xlen = 0, ylen = 0, zlen = 0, color = c('grey100'), alpha=0.5)
+spheres3d(x = m[,1], y= m[,2], z= m[,3], r = 0.2, color = "blue", radius = 2)
+legend3d("topleft", legend = c("Primary solid Tumor", "Solid Tissue Normal"), pch = 16, col = c("yellow", "blue"), cex=2)
+
+```
+
+## Create data partitions
+
+We use a seed to make results reproducible, and partition into $0.80-0.20$
+training and testing sets, respectively. 
+
+```{r Partitions}
+# Divide data into training and testing set
+
+# Set (random-number-generator) seed so that results are consistent between runs.
+set.seed(42)
+train_ids = createDataPartition(d_resp, p=0.80, list=FALSE)
+
+#Select covariates for training using a seed, the complement is used for testing
+x_train = d_mat_subselection[train_ids, ]
+x_test  = d_mat_subselection[-train_ids, ]
+
+#Likewise, choose corresponding responses.
+y_train = d_resp[train_ids]
+y_test  = d_resp[-train_ids]
+```
+
+### Save partitions for:
+
+  -1 Reproducibility
+  -2 Data transfer for neural network model
+  
+Also, it is always good to have a backup.
+```{r Save data}
+# Save (covariates, predicted)
+train_data = cbind(x_train, y_train)
+test_data = cbind(x_test, y_test)
+write.csv(train_data, "train_data.csv")
+write.csv(test_data, "test_data.csv")
+```
+
+  
+
+
+## Elastic Net model
+
+A combination of Ridge Regression and LASSO, the elastic net model, we train
+an the model usig cross-validation for parameter selection
+
+```{r}
+set.seed(42)
+train_data = data.frame(train_data)
+train_data$y_train = as.factor(train_data$y_train)
+best_elnet_model <- train(
+  y_train ~., data = train_data,family = "binomial", method = "glmnet",
+  trControl = trainControl("cv", number = 10),
+  tuneLength = 5
+  )
+
+best_elnet_model$bestTune
+```
+Parameter selection plot is shown here:
+
+```{r}
+plot(best_elnet_model)
+```
+
+
+### Train Predictions
+Calculate train predictions for elastic net model
+```{r}
+elnet_train_predictions = predict(best_elnet_model, x_train)
+table(elnet_train_predictions, as.factor(y_train))
+```
+
+
+### Test Predictions 
+
+Calculate test predictions for elastic net model
+```{r}
+elnet_test_predictions = predict(best_elnet_model, x_test)
+table(elnet_test_predictions, as.factor(y_test))
+```
+
+
+
+
+
+## Random Forest
+Train random forest with seed
+```{r}
+set.seed(42)
+random_forest = randomForest(x = x_train, y = y_train, importance=TRUE)
+```
+
+
+
+### Train Predictions
+Calculate train predictions for random forest
+```{r}
+randomForest_train_predictions = predict(random_forest, x_train)
+table(randomForest_train_predictions, y_train)
+```
+
+
+### Test Predictions
+Calculate the test predictions for the random forest
+```{r}
+randomForest_test_predictions = predict(random_forest, x_test)
+table(randomForest_test_predictions, y_test)
+```
+
+
+
+
+### OOB Error
+
+Out-of-bag error for random forest is an estimate of prediction error, we will
+use this figure to illustrate that the random forest algorithm is, in fact, 
+overfitting on train data.
+```{r}
+layout(matrix(c(1,2),nrow=1),
+       width=c(5,2)) 
+par(mar=c(5,4,4,0)) #No margin on the right side
+plot(random_forest, log="y", main="Random Forest OOB")
+par(mar=c(5,0,4,2)) #No margin on the left side
+plot(c(0,1),type="n", axes=F, xlab="", ylab="")
+legend("top", colnames(random_forest$err.rate),col=1:4,cex=0.8,fill=1:10)
+
+```
+
+
+
+
+
